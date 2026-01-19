@@ -1,0 +1,145 @@
+name: pgroonga
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Forçar build mesmo se a tag já existir'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 0 1 * *' # mensal
+
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: mychelcosta/pgroonga
+  PG_VERSION: "18"
+
+jobs:
+  # --------------------------------------------------
+  # Job 1 — Check de versões e decisão de build
+  # --------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      target_tag: ${{ steps.check.outputs.target_tag }}
+      pgr_ver: ${{ steps.check.outputs.pgr_ver }}
+      vc_ver: ${{ steps.check.outputs.vc_ver }}
+
+    steps:
+      - id: check
+        name: Verificar versões e tag existente
+        run: |
+          set -e
+
+          PGR_VER=$(curl -s https://api.github.com/repos/pgroonga/pgroonga/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+          VC_VER=$(curl -s https://api.github.com/repos/tensorchord/VectorChord/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+
+          TARGET_TAG="${PGR_VER}-pg${{ env.PG_VERSION }}-vc${VC_VER}"
+
+          echo "target_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "pgr_ver=$PGR_VER" >> "$GITHUB_OUTPUT"
+          echo "vc_ver=$VC_VER" >> "$GITHUB_OUTPUT"
+
+          AUTH_TOKEN=$(echo -n "${{ secrets.GITHUB_TOKEN }}" | base64)
+          TAGS=$(curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+            https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list)
+
+          EXISTS=$(echo "$TAGS" | jq --arg TAG "$TARGET_TAG" '.tags | if type=="array" then any(.==$TAG) else false end')
+
+          if [ "$EXISTS" = "false" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TARGET_TAG já existe — pulando build."
+          fi
+
+  # --------------------------------------------------
+  # Job 2 — Build por arquitetura (com cache)
+  # --------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: ./pgroonga
+          push: true
+          platforms: linux/${{ matrix.arch }}
+
+          build-args: |
+            PG_MAJOR=${{ env.PG_VERSION }}
+            PGROONGA_TAG=${{ needs.check.outputs.pgr_ver }}
+            VCHORD_TAG=${{ needs.check.outputs.vc_ver }}
+
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.target_tag }}-${{ matrix.arch }}
+
+          # Cache GHA por arquitetura
+          cache-from: type=gha,scope=pgroonga-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=pgroonga-${{ matrix.arch }}
+
+          # Explicitamente desativado
+          sbom: false
+          provenance: false
+
+  # --------------------------------------------------
+  # Job 3 — Manifest multi-arch (tag final)
+  # --------------------------------------------------
+  manifest:
+    needs: [check, build]
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Criar manifest multi-arch
+        run: |
+          set -e
+
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}"
+          TAG="${{ needs.check.outputs.target_tag }}"
+
+          docker buildx imagetools create \
+            -t ${IMAGE}:${TAG} \
+            ${IMAGE}:${TAG}-amd64 \
+            ${IMAGE}:${TAG}-arm64
+
+          docker buildx imagetools create \
+            -t ${IMAGE}:latest \
+            ${IMAGE}:${TAG}-amd64 \
+            ${IMAGE}:${TAG}-arm64

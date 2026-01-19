@@ -1,0 +1,101 @@
+name: caddy
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Forçar build mesmo se a versão já existir'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 0 * * 1' # Segunda-feira
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: mychelcosta/caddy
+
+jobs:
+  # --------------------------------------------------
+  # Job 1 — Check de versão
+  # --------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - id: check
+        name: Verificar versão do Caddy
+        run: |
+          set -e
+
+          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest \
+            | jq -r '.tag_name' | sed 's/^v//')
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          AUTH_TOKEN=$(echo -n "${{ secrets.GITHUB_TOKEN }}" | base64)
+          TAGS=$(curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
+            https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list)
+
+          EXISTS=$(echo "$TAGS" | jq --arg TAG "$VERSION" '.tags | if type=="array" then any(.==$TAG) else false end')
+
+          if [ "$EXISTS" = "false" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Versão $VERSION já existe — pulando build."
+          fi
+
+  # --------------------------------------------------
+  # Job 2 — Build multi-arch (com cache)
+  # --------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./caddy
+          push: true
+          platforms: linux/amd64,linux/arm64
+
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }}
+
+          labels: |
+            org.opencontainers.image.title=Caddy
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.description=Caddy com Cloudflare e Ratelimit
+
+          # Cache GHA
+          cache-from: type=gha,scope=caddy
+          cache-to: type=gha,mode=max,scope=caddy
+
+          # Explicitamente desativado
+          sbom: false
+          provenance: false
