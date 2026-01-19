@@ -8,7 +8,8 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '0 0 * * 1' # Segunda-feira
+    - cron: '0 0 * * 1' # Segunda-feira (UTC)
+
 
 permissions:
   contents: read
@@ -19,7 +20,7 @@ env:
 
 jobs:
   # --------------------------------------------------
-  # Job 1 — Check de versão
+  # Job 1 — Check de versão e decisão de build
   # --------------------------------------------------
   check:
     runs-on: ubuntu-latest
@@ -33,8 +34,7 @@ jobs:
         run: |
           set -e
 
-          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest \
-            | jq -r '.tag_name' | sed 's/^v//')
+          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r '.tag_name' | sed 's/^v//')
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -42,29 +42,30 @@ jobs:
           TAGS=$(curl -s -H "Authorization: Bearer $AUTH_TOKEN" \
             https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list)
 
-          EXISTS=$(echo "$TAGS" | jq --arg TAG "$VERSION" '.tags | if type=="array" then any(.==$TAG) else false end')
+          EXISTS=$(echo "$TAGS" | jq --arg T "$VERSION" '.tags | if type=="array" then any(.==$T) else false end')
 
           if [ "$EXISTS" = "false" ] || [ "${{ inputs.force }}" = "true" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "Versão $VERSION já existe — pulando build."
+            echo "Tag $VERSION já existe — pulando build."
           fi
 
   # --------------------------------------------------
-  # Job 2 — Build multi-arch (com cache)
+  # Job 2 — Build por arquitetura (isolado + cache)
   # --------------------------------------------------
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Setup Buildx
         uses: docker/setup-buildx-action@v3
@@ -76,26 +77,55 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build e push (multi-arch)
+      - name: Build e push (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
           context: ./caddy
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/${{ matrix.arch }}
 
           tags: |
-            ghcr.io/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }}
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }}-${{ matrix.arch }}
 
-          labels: |
-            org.opencontainers.image.title=Caddy
-            org.opencontainers.image.version=${{ needs.check.outputs.version }}
-            org.opencontainers.image.description=Caddy com Cloudflare e Ratelimit
-
-          # Cache GHA
-          cache-from: type=gha,scope=caddy
-          cache-to: type=gha,mode=max,scope=caddy
+          # Cache GHA por arquitetura
+          cache-from: type=gha,scope=caddy-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=caddy-${{ matrix.arch }}
 
           # Explicitamente desativado
           sbom: false
           provenance: false
+
+  # --------------------------------------------------
+  # Job 3 — Manifest multi-arch (tag final)
+  # --------------------------------------------------
+  manifest:
+    needs: [check, build]
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Criar manifest multi-arch
+        run: |
+          set -e
+
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}"
+          VERSION="${{ needs.check.outputs.version }}"
+
+          # Tag de versão
+          docker buildx imagetools create \
+            -t ${IMAGE}:${VERSION} \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
+
+          # Tag latest
+          docker buildx imagetools create \
+            -t ${IMAGE}:latest \
+            ${IMAGE}:${VERSION}-amd64 \
+            ${IMAGE}:${VERSION}-arm64
