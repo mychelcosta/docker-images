@@ -1,4 +1,4 @@
-name: caddy
+name: Build e publicar imagem do Caddy
 
 on:
   workflow_dispatch:
@@ -19,9 +19,6 @@ env:
   IMAGE_NAME: mychelcosta/caddy
 
 jobs:
-  # --------------------------------------------------
-  # Job 1 — Check de versão e decisão de build
-  # --------------------------------------------------
   check:
     runs-on: ubuntu-latest
     outputs:
@@ -51,9 +48,6 @@ jobs:
             echo "Tag $VERSION já existe — pulando build."
           fi
 
-  # --------------------------------------------------
-  # Job 2 — Build por arquitetura (isolado + cache)
-  # --------------------------------------------------
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
@@ -87,17 +81,12 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.version }}-${{ matrix.arch }}
 
-          # Cache GHA por arquitetura
           cache-from: type=gha,scope=caddy-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=caddy-${{ matrix.arch }}
 
-          # Explicitamente desativado
           sbom: false
           provenance: false
 
-  # --------------------------------------------------
-  # Job 3 — Manifest multi-arch (tag final)
-  # --------------------------------------------------
   manifest:
     needs: [check, build]
     if: needs.check.outputs.build == 'true'

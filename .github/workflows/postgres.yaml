@@ -1,4 +1,4 @@
-name: pgroonga
+name: Build e publicar imagem do PostgreSQL
 
 on:
   workflow_dispatch:
@@ -16,13 +16,10 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: mychelcosta/pgroonga
+  IMAGE_NAME: mychelcosta/postgres
   PG_VERSION: "18"
 
 jobs:
-  # --------------------------------------------------
-  # Job 1 — Check de versões e decisão de build
-  # --------------------------------------------------
   check:
     runs-on: ubuntu-latest
     outputs:
@@ -40,7 +37,7 @@ jobs:
           PGR_VER=$(curl -s https://api.github.com/repos/pgroonga/pgroonga/releases/latest | jq -r '.tag_name' | sed 's/^v//')
           VC_VER=$(curl -s https://api.github.com/repos/tensorchord/VectorChord/releases/latest | jq -r '.tag_name' | sed 's/^v//')
 
-          TARGET_TAG="${PGR_VER}-pg${{ env.PG_VERSION }}-vc${VC_VER}"
+          TARGET_TAG="${{ env.PG_VERSION }}-pgroonga${PGR_VER}-vchord${VC_VER}"
 
           echo "target_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
           echo "pgr_ver=$PGR_VER" >> "$GITHUB_OUTPUT"
@@ -59,9 +56,6 @@ jobs:
             echo "Tag $TARGET_TAG já existe — pulando build."
           fi
 
-  # --------------------------------------------------
-  # Job 2 — Build por arquitetura (com cache)
-  # --------------------------------------------------
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
@@ -91,7 +85,7 @@ jobs:
       - name: Build e push (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
-          context: ./pgroonga
+          context: ./postgres
           push: true
           platforms: linux/${{ matrix.arch }}
 
@@ -103,17 +97,12 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.check.outputs.target_tag }}-${{ matrix.arch }}
 
-          # Cache GHA por arquitetura
           cache-from: type=gha,scope=pgroonga-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=pgroonga-${{ matrix.arch }}
 
-          # Explicitamente desativado
           sbom: false
           provenance: false
 
-  # --------------------------------------------------
-  # Job 3 — Manifest multi-arch (tag final)
-  # --------------------------------------------------
   manifest:
     needs: [check, build]
     if: needs.check.outputs.build == 'true'
